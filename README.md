@@ -1,36 +1,105 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+Вся работа заняла 1:00ч- 1:30ч
 
-## Getting Started
+# Бронирование переговорной комнаты
 
-First, run the development server:
+Интерфейс бронирования одной переговорной на рабочий день 09:00–18:00. Next.js (App Router), React, TypeScript. Бэкенд — mock на Route Handlers с in-memory хранилищем.
+
+## Запуск
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm test
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Для тестов нужен `tsx`, скрипт: `"test": "tsx --test lib/bookings/*.test.ts"`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Возможности
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- выбор даты (прошедшие даты недоступны);
+- таймлайн дня и список броней на выбранную дату;
+- создание, редактирование и удаление брони (удаление с подтверждением);
+- состояния: загрузка, пустой день, ошибка загрузки с повтором, отправка формы.
 
-## Learn More
+## Структура
 
-To learn more about Next.js, take a look at the following resources:
+```
+app/api/bookings/route.ts        GET, POST
+app/api/bookings/[id]/route.ts   PATCH, DELETE
+components/                      UI: Dashboard, BookingDialog, BookingList, Timeline, Modal, ConfirmDialog
+lib/bookings/
+  types.ts        контракт Booking / BookingInput
+  constants.ts    рабочий день, ограничения длительности, комната
+  time.ts         разбор и форматирование времени, ближайший доступный слот
+  timeline.ts     геометрия таймлайна
+  booking.ts      нормализация, сортировка, заголовок
+  rules.ts        бизнес-правила (единственный источник валидации)
+  guards.ts       проверка формы данных на границах (запрос и ответ)
+  errors.ts       ошибки сервера с HTTP-статусами
+  store.ts        in-memory хранилище
+  api.ts          помощники Route Handlers
+  service.ts      клиент API (fetch)
+  useBookings.ts  загрузка и мутации для UI
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## API
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Метод  | Путь                            | Ответ                   |
+| ------ | ------------------------------- | ----------------------- |
+| GET    | `/api/bookings?date=YYYY-MM-DD` | `200 { bookings }`      |
+| POST   | `/api/bookings`                 | `201 Booking`           |
+| PATCH  | `/api/bookings/:id`             | `200 Booking`           |
+| DELETE | `/api/bookings/:id`             | `200 { success: true }` |
 
-## Deploy on Vercel
+Ошибки всегда приходят как `{ error: string }`:
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+| Статус | Когда                                                                           |
+| ------ | ------------------------------------------------------------------------------- |
+| 400    | некорректный JSON, нет обязательных полей, неверный параметр `date`             |
+| 404    | брони не существует (только PATCH)                                              |
+| 409    | слот пересекается с другой бронью                                               |
+| 422    | нарушено правило (прошлое, вне рабочего дня, длительность, шаг, длина названия) |
+| 500    | непредвиденная ошибка                                                           |
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+`PATCH` принимает полное описание брони. `DELETE` идемпотентен: удаление уже удалённой брони считается успехом.
+
+## Бизнес-правила
+
+Все правила реализованы одной функцией `validateBooking` в `rules.ts`. Её используют форма (мгновенная обратная связь) и сервер (источник истины).
+
+1. Время в пределах 09:00–18:00.
+2. `start < end`.
+3. Минимум 30 минут, максимум 2 часа.
+4. Время начала и окончания кратно 30 минутам.
+5. Брони не пересекаются; касание границ допустимо (10:00–11:00 и 11:00–12:00).
+6. Нельзя бронировать прошлое: прошедшие даты недоступны, сегодня начало должно быть позже текущего момента.
+7. При редактировании бронь не конфликтует сама с собой.
+8. Если время начала и дата не менялись, правило «не в прошлом» пропускается, чтобы можно было переименовать или сократить уже идущую встречу.
+
+Границы дня и ограничения заданы в `constants.ts`, тексты ошибок строятся из них.
+
+## Обработка конфликтов
+
+Сервер может отклонить слот, который UI считал свободным. В этом случае:
+
+- форма остаётся открытой, введённые значения сохраняются (поля неуправляемые, форма не перемонтируется);
+- в форме показывается сообщение сервера;
+- расписание за диалогом обновляется в фоне.
+
+То же происходит при 404 (бронь удалили в другой вкладке).
+
+## Решения
+
+- **Один механизм против гонок запросов.** Загрузка привязана к ключу «дата + счётчик перезагрузок», эффект отменяет запрос через `AbortController`, результат показывается только при совпадении ключа. Состояние «загрузка» вычисляется, а не выставляется вручную.
+- **Сетевой слой отделён.** Компоненты не знают про `fetch`: они работают с `useBookings`, который вызывает `service.ts`. Замена на реальный API сводится к правке `service.ts`.
+- **Ошибки сервиса безопасны для UI.** Сетевые сбои и ответы не в JSON превращаются в `BookingApiError` с понятным текстом.
+- **Бронь всегда на выбранный день.** Дата в форме не меняется: это убирает целый класс ложных конфликтов и «исчезающих» броней.
+- **Нативный `<dialog>`.** Фокус-ловушку, Escape и блокировку фона обеспечивает браузер. Для стилей нужен `dialog-reset.css`.
+- **Таймлайн — визуальный.** Он скрыт от скринридеров и вне табуляции, доступные действия есть в списке.
+
+## Ограничения
+
+- Хранилище в памяти одного процесса: на serverless-хостинге данные теряются и расходятся между инстансами. Для продакшена `store.ts` нужно заменить на базу данных, а проверку пересечения и запись делать в одной транзакции.
+- «Сегодня» и «сейчас» считаются по часовому поясу того, где выполняется код (браузер или сервер). Для единой комнаты стоит зафиксировать её часовой пояс.
+- Нет авторизации: любой клиент может изменить любую бронь.
+- Одна комната. Для нескольких понадобится `roomId` в `Booking` и параметр в API.
